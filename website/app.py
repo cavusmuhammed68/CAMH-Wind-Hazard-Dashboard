@@ -29,6 +29,7 @@ TRACK_CANDIDATES = [
     os.path.join(BASE_DIR, "C3S_StormTracks_ERA5_1979_2021_clean.csv"),
 ]
 
+
 # =================================================
 # LOADERS
 # =================================================
@@ -44,35 +45,67 @@ def load_geojson(path: str) -> dict:
 
 @st.cache_data
 def load_tracks(paths: list[str]) -> pd.DataFrame:
+
     track_path = None
+
     for p in paths:
         if os.path.exists(p):
             track_path = p
             break
 
     if track_path is None:
+        st.warning("ERA5 storm-track file not found.")
         return pd.DataFrame()
 
-    tracks = pd.read_csv(track_path).copy()
+    # Robust CSV loading for large files
+    try:
+        tracks = pd.read_csv(
+            track_path,
+            low_memory=False,
+            encoding="utf-8"
+        )
+    except:
+        tracks = pd.read_csv(
+            track_path,
+            low_memory=False,
+            encoding="latin1"
+        )
 
+    tracks = tracks.copy()
+
+    # -----------------------------
+    # Standardise column names
+    # -----------------------------
     rename_map = {}
+
     for c in tracks.columns:
+
         cl = c.lower()
+
         if cl in ["lat", "latitude"]:
             rename_map[c] = "latitude"
+
         elif cl in ["lon", "longitude", "lng", "long"]:
             rename_map[c] = "longitude"
+
         elif cl == "year":
             rename_map[c] = "year"
+
         elif cl == "value":
             rename_map[c] = "value"
+
         elif cl in ["storm_id", "id", "track_id", "stormid"]:
             rename_map[c] = "storm_id"
 
     tracks = tracks.rename(columns=rename_map)
 
+    # -----------------------------
+    # Required columns check
+    # -----------------------------
     required = {"latitude", "longitude", "year"}
+
     if not required.issubset(tracks.columns):
+        st.warning("Storm track dataset missing required columns.")
         return pd.DataFrame()
 
     if "value" not in tracks.columns:
@@ -81,12 +114,20 @@ def load_tracks(paths: list[str]) -> pd.DataFrame:
     if "storm_id" not in tracks.columns:
         tracks["storm_id"] = tracks.groupby("year").cumcount().astype(str)
 
-    tracks = tracks.dropna(subset=["latitude", "longitude", "year"]).copy()
+    # -----------------------------
+    # Clean data
+    # -----------------------------
+    tracks = tracks.dropna(subset=["latitude", "longitude", "year"])
+
     tracks["year"] = pd.to_numeric(tracks["year"], errors="coerce")
-    tracks = tracks.dropna(subset=["year"]).copy()
+    tracks = tracks.dropna(subset=["year"])
+
     tracks["year"] = tracks["year"].astype(int)
 
-    tracks["longitude"] = tracks["longitude"].apply(lambda x: x - 360 if x > 180 else x)
+    # Convert 0–360 longitude to -180–180
+    tracks["longitude"] = tracks["longitude"].apply(
+        lambda x: x - 360 if x > 180 else x
+    )
 
     return tracks
 

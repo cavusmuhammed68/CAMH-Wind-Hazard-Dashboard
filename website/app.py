@@ -1,40 +1,106 @@
-import streamlit as st
-import pandas as pd
-import plotly.express as px
-import json
 import os
+import json
+import numpy as np
+import pandas as pd
+import streamlit as st
+import plotly.express as px
+import plotly.graph_objects as go
 
-# -------------------------------------------------
+# =================================================
 # PAGE CONFIG
-# -------------------------------------------------
+# =================================================
 
-st.set_page_config(layout="wide", page_title="Regional Wind Hazard Dashboard")
+st.set_page_config(layout="wide", page_title="Climate Digital Twin Dashboard")
+st.title("Climate Digital Twin Dashboard")
+st.markdown("Regional hazard, storm-track, risk, and digital-twin style climate dashboard")
 
-st.title("Regional Wind Hazard Dashboard")
-st.markdown("Storm-track buffer based regional wind severity")
-
-# -------------------------------------------------
+# =================================================
 # PATHS
-# -------------------------------------------------
+# =================================================
 
 BASE_DIR = os.path.dirname(__file__)
 
 DATA_PATH = os.path.join(BASE_DIR, "data", "hazard_final.parquet")
 GEO_PATH = os.path.join(BASE_DIR, "geo", "nuts3_NE_Yorkshire.geojson")
 
-# -------------------------------------------------
-# LOAD DATA
-# -------------------------------------------------
+TRACK_CANDIDATES = [
+    os.path.join(BASE_DIR, "data_raw", "C3S_StormTracks_ERA5_1979_2021_clean.csv"),
+    os.path.join(BASE_DIR, "..", "data_raw", "C3S_StormTracks_ERA5_1979_2021_clean.csv"),
+    os.path.join(BASE_DIR, "C3S_StormTracks_ERA5_1979_2021_clean.csv"),
+]
+
+# =================================================
+# LOADERS
+# =================================================
 
 @st.cache_data
-def load_data():
-    return pd.read_parquet(DATA_PATH)
+def load_parent_data(path: str) -> pd.DataFrame:
+    return pd.read_parquet(path).copy()
 
-df = load_data()
+@st.cache_data
+def load_geojson(path: str) -> dict:
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
 
-# -------------------------------------------------
-# REGION → NUTS3 MAP
-# -------------------------------------------------
+@st.cache_data
+def load_tracks(paths: list[str]) -> pd.DataFrame:
+    track_path = None
+    for p in paths:
+        if os.path.exists(p):
+            track_path = p
+            break
+
+    if track_path is None:
+        return pd.DataFrame()
+
+    tracks = pd.read_csv(track_path).copy()
+
+    rename_map = {}
+    for c in tracks.columns:
+        cl = c.lower()
+        if cl in ["lat", "latitude"]:
+            rename_map[c] = "latitude"
+        elif cl in ["lon", "longitude", "lng", "long"]:
+            rename_map[c] = "longitude"
+        elif cl == "year":
+            rename_map[c] = "year"
+        elif cl == "value":
+            rename_map[c] = "value"
+        elif cl in ["storm_id", "id", "track_id", "stormid"]:
+            rename_map[c] = "storm_id"
+
+    tracks = tracks.rename(columns=rename_map)
+
+    required = {"latitude", "longitude", "year"}
+    if not required.issubset(tracks.columns):
+        return pd.DataFrame()
+
+    if "value" not in tracks.columns:
+        tracks["value"] = 1.0
+
+    if "storm_id" not in tracks.columns:
+        tracks["storm_id"] = tracks.groupby("year").cumcount().astype(str)
+
+    tracks = tracks.dropna(subset=["latitude", "longitude", "year"]).copy()
+    tracks["year"] = pd.to_numeric(tracks["year"], errors="coerce")
+    tracks = tracks.dropna(subset=["year"]).copy()
+    tracks["year"] = tracks["year"].astype(int)
+
+    tracks["longitude"] = tracks["longitude"].apply(lambda x: x - 360 if x > 180 else x)
+
+    return tracks
+
+# =================================================
+# SOURCE DATA
+# =================================================
+
+df_parent = load_parent_data(DATA_PATH)
+geojson = load_geojson(GEO_PATH)
+tracks = load_tracks(TRACK_CANDIDATES)
+
+# =================================================
+# REGION -> NUTS3 MAP
+# =================================================
 
 nuts_map = {
     "North East": [
@@ -44,7 +110,7 @@ nuts_map = {
         "Tyneside",
         "Darlington",
         "Hartlepool and Stockton-on-Tees",
-        "South Teesside"
+        "South Teesside",
     ],
     "Yorkshire and The Humber": [
         "Leeds",
@@ -56,143 +122,647 @@ nuts_map = {
         "Barnsley, Doncaster and Rotherham",
         "North Yorkshire CC",
         "East Riding of Yorkshire",
-        "Kingston upon Hull, City of"
-    ]
+        "Kingston upon Hull, City of",
+        "North and North East Lincolnshire",
+    ],
 }
 
-# -------------------------------------------------
-# EXPAND DATASET TO NUTS3
-# -------------------------------------------------
-import numpy as np
+sub_to_parent = {
+    sub: parent
+    for parent, subs in nuts_map.items()
+    for sub in subs
+}
 
-rows = []
+# =================================================
+# EXPAND TO SUBREGIONS
+# =================================================
 
-for _, r in df.iterrows():
-    subs = nuts_map[r["region"]]
-    
-    for i, sub in enumerate(subs):
+@st.cache_data
+def expand_to_subregions(df_parent_in: pd.DataFrame) -> pd.DataFrame:
+    rows = []
 
-        # küçük varyasyon ekle
-        variation = np.random.uniform(0.85, 1.15)
+    for _, r in df_parent_in.iterrows():
+        parent = r["region"]
+        subs = nuts_map.get(parent, [])
+        if not subs:
+            continue
 
-        rows.append({
-            "year": r["year"],
-            "region": sub,
-            "W_mean": r["W_mean"] * variation,
-            "n_storm_pts": r["n_storm_pts"],
-            "W_mean_norm_region": r["W_mean_norm_region"] * variation
-        })
+        weights = np.linspace(0.90, 1.10, len(subs))
 
-df = pd.DataFrame(rows)
+        for sub, w in zip(subs, weights):
+            rows.append(
+                {
+                    "parent_region": parent,
+                    "region": sub,
+                    "year": int(r["year"]),
+                    "W_mean": float(r["W_mean"]) * float(w),
+                    "n_storm_pts": float(r.get("n_storm_pts", 0)),
+                    "W_mean_norm_region": float(r.get("W_mean_norm_region", 0)) * float(w),
+                }
+            )
 
-# -------------------------------------------------
-# SIDEBAR CONTROLS
-# -------------------------------------------------
+    df = pd.DataFrame(rows)
+
+    all_years = sorted(df["year"].unique())
+    all_regions = sorted(df["region"].unique())
+
+    full_index = pd.MultiIndex.from_product(
+        [all_years, all_regions],
+        names=["year", "region"]
+    )
+
+    df = (
+        df.set_index(["year", "region"])
+        .reindex(full_index)
+        .reset_index()
+    )
+
+    df["parent_region"] = df["region"].map(sub_to_parent)
+    df["W_mean"] = df["W_mean"].fillna(0.0)
+    df["n_storm_pts"] = df["n_storm_pts"].fillna(0.0)
+    df["W_mean_norm_region"] = df["W_mean_norm_region"].fillna(0.0)
+
+    df["W_norm_year"] = df.groupby("year")["W_mean"].transform(
+        lambda s: s / s.max() if s.max() > 0 else 0.0
+    )
+
+    df["W_sub_norm"] = df.groupby("region")["W_mean"].transform(
+        lambda s: (s - s.min()) / (s.max() - s.min()) if s.max() > s.min() else 0.0
+    )
+
+    # Proxy variables for digital twin layers
+    df["MHI"] = 0.70 * df["W_norm_year"] + 0.30 * df["W_sub_norm"]
+    alpha = 1.8
+    xi = 0.5 * df["W_sub_norm"] + 0.5 * df["W_norm_year"]
+    df["P_fail"] = 1.0 - np.exp(-alpha * df["MHI"] * xi)
+
+    # Curtailment risk proxy
+    df["Curtailment_Risk"] = np.clip(0.60 * df["MHI"] + 0.40 * df["P_fail"], 0, 1)
+
+    # Simulated node failure pressure
+    df["Node_Failure_Pressure"] = np.clip(0.55 * df["P_fail"] + 0.45 * df["W_sub_norm"], 0, 1)
+
+    return df
+
+df = expand_to_subregions(df_parent)
+
+# =================================================
+# SIDEBAR
+# =================================================
 
 st.sidebar.header("Controls")
 
-region = st.sidebar.selectbox(
-    "Select Region",
-    ["North East", "Yorkshire and The Humber"]
+selected_parent = st.sidebar.selectbox(
+    "Select Main Region",
+    sorted(df["parent_region"].dropna().unique())
 )
 
-year = st.sidebar.slider(
+selected_year = st.sidebar.slider(
     "Select Year",
     int(df["year"].min()),
     int(df["year"].max()),
     int(df["year"].min())
 )
 
-# -------------------------------------------------
-# FILTER DATA
-# -------------------------------------------------
+scenario = st.sidebar.selectbox(
+    "Scenario",
+    ["Baseline", "Mild", "Gradual", "Escalation"]
+)
 
-df_year = df[df["year"] == year].copy()
+show_both_regions = st.sidebar.checkbox("Show both main regions on map", value=True)
 
-# -------------------------------------------------
-# LOAD GEOJSON
-# -------------------------------------------------
+scenario_factor = {
+    "Baseline": 1.00,
+    "Mild": 1.10,
+    "Gradual": 1.25,
+    "Escalation": 1.50,
+}[scenario]
 
-with open(GEO_PATH) as f:
-    geojson = json.load(f)
+# =================================================
+# FILTERS
+# =================================================
 
-# -------------------------------------------------
-# NORMALISE DATA
-# -------------------------------------------------
+df_selected_parent = df[df["parent_region"] == selected_parent].copy()
+df_selected_year = df_selected_parent[df_selected_parent["year"] == selected_year].copy()
 
-if df_year["W_mean"].max() > 0:
-    df_year["W_norm_year"] = df_year["W_mean"] / df_year["W_mean"].max()
+if show_both_regions:
+    df_map_year = df[df["year"] == selected_year].copy()
 else:
-    df_year["W_norm_year"] = 0
+    df_map_year = df_selected_year.copy()
 
-# -------------------------------------------------
-# MAP
-# -------------------------------------------------
-
-st.subheader("Wind Hazard Map (Year-scaled comparison)")
-
-fig_map = px.choropleth(
-    df_year,
-    geojson=geojson,
-    locations="region",
-    featureidkey="properties.NUTS_NAME",
-    color="W_norm_year",
-    range_color=[0, 1],
-    color_continuous_scale="YlOrRd",
-    hover_data={
-        "region": True,
-        "year": True,
-        "W_mean": ":.2f",
-        "n_storm_pts": True,
-    }
+df_map_year["MHI_scenario"] = np.clip(df_map_year["MHI"] * scenario_factor, 0, 1.5)
+df_map_year["P_fail_scenario"] = 1.0 - np.exp(
+    -1.8 * df_map_year["MHI_scenario"] * (0.5 + 0.5 * df_map_year["W_sub_norm"])
+)
+df_map_year["Curtailment_Risk_Scenario"] = np.clip(
+    0.60 * df_map_year["MHI_scenario"] + 0.40 * df_map_year["P_fail_scenario"], 0, 1
+)
+df_map_year["Node_Failure_Scenario"] = np.clip(
+    0.55 * df_map_year["P_fail_scenario"] + 0.45 * df_map_year["W_sub_norm"], 0, 1
 )
 
-fig_map.update_geos(
-    fitbounds="locations",
-    visible=False
+df_selected_parent["MHI_scenario"] = np.clip(df_selected_parent["MHI"] * scenario_factor, 0, 1.5)
+df_selected_parent["P_fail_scenario"] = 1.0 - np.exp(
+    -1.8 * df_selected_parent["MHI_scenario"] * (0.5 + 0.5 * df_selected_parent["W_sub_norm"])
 )
 
-st.plotly_chart(fig_map, use_container_width=True)
+# =================================================
+# TABS
+# =================================================
 
-# -------------------------------------------------
-# TREND
-# -------------------------------------------------
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
+    "Storm Animation Map",
+    "ERA5 Storm Tracks",
+    "Hazard Timeline",
+    "Climate Risk Dashboard",
+    "Scenario Simulation",
+    "Storm Intensity Surface",
+    "Return Period Analysis",
+    "Node Failure & Curtailment",
+])
 
-st.subheader("Trend Over Time (Absolute Severity)")
+# =================================================
+# TAB 1 - STORM ANIMATION MAP
+# =================================================
 
-fig_trend = px.line(
-    df[df["region"].isin(nuts_map[region])],
-    x="year",
-    y="W_mean",
-    markers=True
-)
+with tab1:
+    st.subheader("Storm Animation Map")
 
-st.plotly_chart(fig_trend, use_container_width=True)
+    anim_df = df.copy()
+    if not show_both_regions:
+        anim_df = anim_df[anim_df["parent_region"] == selected_parent].copy()
 
-# -------------------------------------------------
-# HEATMAP
-# -------------------------------------------------
+    fig_anim = px.choropleth(
+        anim_df,
+        geojson=geojson,
+        locations="region",
+        featureidkey="properties.NUTS_NAME",
+        color="W_norm_year",
+        animation_frame="year",
+        color_continuous_scale="Turbo",
+        range_color=[0, 1],
+        hover_data={
+            "parent_region": True,
+            "region": True,
+            "year": True,
+            "W_mean": ":.2f",
+            "W_norm_year": ":.2f",
+            "MHI": ":.2f",
+            "P_fail": ":.2f",
+        },
+    )
 
-st.subheader("Heatmap (Relative Within Each Region)")
+    fig_anim.update_geos(fitbounds="locations", visible=False)
+    fig_anim.update_traces(marker_line_width=0.9, marker_line_color="black")
+    fig_anim.update_layout(height=650, margin=dict(l=0, r=0, t=30, b=0))
 
-heat = df.pivot(
-    index="region",
-    columns="year",
-    values="W_mean_norm_region"
-)
+    st.plotly_chart(fig_anim, use_container_width=True)
 
-fig_heat = px.imshow(
-    heat,
-    aspect="auto",
-    color_continuous_scale="YlOrRd",
-    zmin=0,
-    zmax=1
-)
+# =================================================
+# TAB 2 - ERA5 STORM TRACKS
+# =================================================
 
-fig_heat.update_layout(
-    coloraxis_colorbar_title="Relative Severity (0–1)",
-    xaxis_title="Year",
-    yaxis_title="Region"
-)
+with tab2:
+    st.subheader("ERA5 Storm Tracks")
 
-st.plotly_chart(fig_heat, use_container_width=True)
+    if tracks.empty:
+        st.warning("ERA5 storm-track file could not be found. Place C3S_StormTracks_ERA5_1979_2021_clean.csv in website/data_raw.")
+    else:
+        subtab1, subtab2, subtab3 = st.tabs([
+            "Track Points",
+            "Trajectory Lines",
+            "Storm Impact Overlay",
+        ])
+
+        with subtab1:
+            fig_tracks = px.scatter_mapbox(
+                tracks,
+                lat="latitude",
+                lon="longitude",
+                animation_frame="year",
+                color="value",
+                size="value",
+                size_max=12,
+                zoom=4.7,
+                center={"lat": 54.5, "lon": -1.8},
+                color_continuous_scale="Turbo",
+                hover_data={
+                    "storm_id": True,
+                    "year": True,
+                    "latitude": ":.2f",
+                    "longitude": ":.2f",
+                    "value": ":.2f",
+                },
+            )
+
+            fig_tracks.update_layout(
+                mapbox_style="carto-positron",
+                height=700,
+                margin=dict(l=0, r=0, t=10, b=0),
+            )
+
+            st.plotly_chart(fig_tracks, use_container_width=True)
+
+        with subtab2:
+            line_year = st.slider(
+                "Select year for trajectory lines",
+                int(tracks["year"].min()),
+                int(tracks["year"].max()),
+                int(tracks["year"].min()),
+                key="line_year_slider",
+            )
+
+            tracks_line = tracks[tracks["year"] == line_year].copy()
+
+            fig_lines = px.line_mapbox(
+                tracks_line.sort_values(["storm_id"]),
+                lat="latitude",
+                lon="longitude",
+                color="storm_id",
+                line_group="storm_id",
+                hover_data={
+                    "storm_id": True,
+                    "year": True,
+                    "value": ":.2f",
+                },
+                zoom=4.8,
+                center={"lat": 54.5, "lon": -1.8},
+            )
+
+            fig_lines.update_layout(
+                mapbox_style="carto-positron",
+                height=700,
+                margin=dict(l=0, r=0, t=10, b=0),
+                showlegend=False,
+            )
+
+            st.plotly_chart(fig_lines, use_container_width=True)
+
+        with subtab3:
+            overlay_year = st.slider(
+                "Select year for storm impact overlay",
+                int(tracks["year"].min()),
+                int(tracks["year"].max()),
+                min(selected_year, int(tracks["year"].max())),
+                key="overlay_year_slider",
+            )
+
+            tracks_overlay = tracks[tracks["year"] == overlay_year].copy()
+            risk_overlay = df[df["year"] == overlay_year].copy()
+
+            fig_overlay = px.choropleth_mapbox(
+                risk_overlay,
+                geojson=geojson,
+                locations="region",
+                featureidkey="properties.NUTS_NAME",
+                color="P_fail",
+                color_continuous_scale="RdYlBu_r",
+                range_color=[0, 1],
+                opacity=0.45,
+                zoom=4.8,
+                center={"lat": 54.5, "lon": -1.8},
+                hover_data={
+                    "region": True,
+                    "parent_region": True,
+                    "P_fail": ":.2f",
+                    "MHI": ":.2f",
+                },
+            )
+
+            fig_overlay.update_layout(
+                mapbox_style="carto-positron",
+                height=700,
+                margin=dict(l=0, r=0, t=10, b=0),
+            )
+
+            fig_overlay.add_scattermapbox(
+                lat=tracks_overlay["latitude"],
+                lon=tracks_overlay["longitude"],
+                mode="markers",
+                marker=dict(size=4, opacity=0.8),
+                text=tracks_overlay["storm_id"].astype(str),
+                name="Storm track points",
+            )
+
+            st.plotly_chart(fig_overlay, use_container_width=True)
+
+# =================================================
+# TAB 3 - HAZARD TIMELINE
+# =================================================
+
+with tab3:
+    st.subheader("Hazard Timeline")
+
+    yearly = (
+        df_selected_parent
+        .groupby("year", as_index=False)
+        .agg(
+            W_mean=("W_mean", "mean"),
+            MHI=("MHI", "mean"),
+            P_fail=("P_fail", "mean"),
+            Curtailment_Risk=("Curtailment_Risk", "mean"),
+        )
+    )
+
+    fig_timeline = go.Figure()
+    fig_timeline.add_trace(go.Scatter(x=yearly["year"], y=yearly["W_mean"], mode="lines+markers", name="Wind hazard"))
+    fig_timeline.add_trace(go.Scatter(x=yearly["year"], y=yearly["MHI"], mode="lines+markers", name="MHI", yaxis="y2"))
+    fig_timeline.add_trace(go.Scatter(x=yearly["year"], y=yearly["P_fail"], mode="lines+markers", name="P_fail", yaxis="y2"))
+    fig_timeline.add_trace(go.Scatter(x=yearly["year"], y=yearly["Curtailment_Risk"], mode="lines+markers", name="Curtailment risk", yaxis="y2"))
+
+    fig_timeline.update_layout(
+        height=560,
+        xaxis_title="Year",
+        yaxis=dict(title="Absolute hazard"),
+        yaxis2=dict(title="Relative index / risk", overlaying="y", side="right", range=[0, 1.05]),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
+        margin=dict(l=20, r=20, t=20, b=20),
+    )
+
+    st.plotly_chart(fig_timeline, use_container_width=True)
+
+# =================================================
+# TAB 4 - CLIMATE RISK DASHBOARD
+# =================================================
+
+with tab4:
+    st.subheader("Climate Risk Dashboard")
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Selected year", selected_year)
+    c2.metric("Mean hazard", f"{df_selected_year['W_mean'].mean():.2f}")
+    c3.metric("Mean MHI", f"{df_selected_year['MHI'].mean():.2f}")
+    c4.metric("Mean P_fail", f"{df_selected_year['P_fail'].mean():.2f}")
+
+    left, right = st.columns([1.25, 1])
+
+    with left:
+        st.markdown("#### Grid failure risk map")
+
+        fig_risk = px.choropleth(
+            df_map_year,
+            geojson=geojson,
+            locations="region",
+            featureidkey="properties.NUTS_NAME",
+            color="P_fail_scenario",
+            color_continuous_scale="RdYlBu_r",
+            range_color=[0, 1],
+            hover_data={
+                "parent_region": True,
+                "region": True,
+                "year": True,
+                "MHI_scenario": ":.2f",
+                "P_fail_scenario": ":.2f",
+                "W_mean": ":.2f",
+            },
+        )
+
+        fig_risk.update_geos(fitbounds="locations", visible=False)
+        fig_risk.update_traces(marker_line_width=0.9, marker_line_color="black")
+        fig_risk.update_layout(height=560, margin=dict(l=0, r=0, t=10, b=0))
+
+        st.plotly_chart(fig_risk, use_container_width=True)
+
+    with right:
+        st.markdown("#### MHI digital twin panel")
+
+        mhi_rank = (
+            df_selected_year[["region", "MHI", "P_fail"]]
+            .sort_values("MHI", ascending=False)
+        )
+
+        fig_mhi_bar = px.bar(
+            mhi_rank,
+            x="MHI",
+            y="region",
+            orientation="h",
+            color="P_fail",
+            color_continuous_scale="Turbo",
+            range_color=[0, 1],
+        )
+
+        fig_mhi_bar.update_layout(height=560, yaxis_title="Subregion", xaxis_title="MHI", margin=dict(l=0, r=0, t=10, b=0))
+        st.plotly_chart(fig_mhi_bar, use_container_width=True)
+
+    st.markdown("#### Relative hazard heatmap")
+
+    heat = df.pivot_table(
+        index="region",
+        columns="year",
+        values="W_sub_norm",
+        aggfunc="mean",
+    )
+
+    fig_heat = px.imshow(
+        heat,
+        aspect="auto",
+        color_continuous_scale="YlOrRd",
+        zmin=0,
+        zmax=1,
+    )
+
+    fig_heat.update_layout(height=500, coloraxis_colorbar_title="Relative severity", xaxis_title="Year", yaxis_title="Subregion")
+    st.plotly_chart(fig_heat, use_container_width=True)
+
+# =================================================
+# TAB 5 - SCENARIO SIMULATION
+# =================================================
+
+with tab5:
+    st.subheader("Scenario Simulation")
+
+    scenario_df = (
+        df_selected_parent
+        .groupby("year", as_index=False)
+        .agg(
+            MHI=("MHI", "mean"),
+            P_fail=("P_fail", "mean"),
+            Curtailment_Risk=("Curtailment_Risk", "mean"),
+        )
+    )
+
+    scen_list = []
+    for name, fac, stress in [
+        ("Mild", 1.10, 0.75),
+        ("Gradual", 1.25, 0.85),
+        ("Escalation", 1.50, 0.95),
+    ]:
+        temp = scenario_df.copy()
+        temp["Scenario"] = name
+        temp["MHI_scenario"] = np.clip(temp["MHI"] * fac, 0, 1.5)
+        temp["P_fail_scenario"] = 1.0 - np.exp(-1.8 * temp["MHI_scenario"] * stress)
+        temp["Curtailment_scenario"] = np.clip(0.60 * temp["MHI_scenario"] + 0.40 * temp["P_fail_scenario"], 0, 1)
+        scen_list.append(temp)
+
+    scen_all = pd.concat(scen_list, ignore_index=True)
+
+    col_a, col_b = st.columns(2)
+
+    with col_a:
+        fig_scen_mhi = px.line(
+            scen_all,
+            x="year",
+            y="MHI_scenario",
+            color="Scenario",
+            markers=True,
+        )
+        fig_scen_mhi.update_layout(height=480, xaxis_title="Year", yaxis_title="Scenario MHI")
+        st.plotly_chart(fig_scen_mhi, use_container_width=True)
+
+    with col_b:
+        fig_scen_pf = px.line(
+            scen_all,
+            x="year",
+            y="P_fail_scenario",
+            color="Scenario",
+            markers=True,
+        )
+        fig_scen_pf.update_layout(height=480, xaxis_title="Year", yaxis_title="Scenario P_fail")
+        st.plotly_chart(fig_scen_pf, use_container_width=True)
+
+    fig_scen_curt = px.line(
+        scen_all,
+        x="year",
+        y="Curtailment_scenario",
+        color="Scenario",
+        markers=True,
+    )
+    fig_scen_curt.update_layout(height=420, xaxis_title="Year", yaxis_title="Scenario curtailment risk")
+    st.plotly_chart(fig_scen_curt, use_container_width=True)
+
+# =================================================
+# TAB 6 - STORM INTENSITY SURFACE
+# =================================================
+
+with tab6:
+    st.subheader("Storm Intensity Surface Map")
+
+    if tracks.empty:
+        st.warning("ERA5 storm-track file could not be found. Place C3S_StormTracks_ERA5_1979_2021_clean.csv in website/data_raw.")
+    else:
+        surface_year = st.slider(
+            "Select year for storm intensity surface",
+            int(tracks["year"].min()),
+            int(tracks["year"].max()),
+            int(tracks["year"].min()),
+            key="surface_year_slider",
+        )
+
+        tracks_surface = tracks[tracks["year"] == surface_year].copy()
+
+        fig_surface = px.density_mapbox(
+            tracks_surface,
+            lat="latitude",
+            lon="longitude",
+            z="value",
+            radius=18,
+            center={"lat": 54.5, "lon": -1.8},
+            zoom=4.8,
+            mapbox_style="carto-positron",
+            color_continuous_scale="Turbo",
+        )
+
+        fig_surface.update_layout(height=700, margin=dict(l=0, r=0, t=10, b=0))
+        st.plotly_chart(fig_surface, use_container_width=True)
+
+# =================================================
+# TAB 7 - RETURN PERIOD ANALYSIS
+# =================================================
+
+with tab7:
+    st.subheader("Return Period Analysis")
+
+    st.caption("This panel uses an empirical extreme-value style return-period estimate from annual maxima.")
+
+    rp_df = (
+        df_selected_parent
+        .groupby("year", as_index=False)
+        .agg(Annual_Max_Hazard=("W_mean", "max"))
+        .sort_values("Annual_Max_Hazard", ascending=False)
+        .reset_index(drop=True)
+    )
+
+    n = len(rp_df)
+    rp_df["rank"] = np.arange(1, n + 1)
+    rp_df["exceedance_prob"] = rp_df["rank"] / (n + 1)
+    rp_df["return_period"] = 1.0 / rp_df["exceedance_prob"]
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        fig_rp = px.scatter(
+            rp_df,
+            x="return_period",
+            y="Annual_Max_Hazard",
+            hover_data={"year": True},
+            log_x=True,
+        )
+        fig_rp.update_layout(height=480, xaxis_title="Return period (years, log scale)", yaxis_title="Annual maximum hazard")
+        st.plotly_chart(fig_rp, use_container_width=True)
+
+    with col2:
+        fig_rank = px.bar(
+            rp_df.sort_values("year"),
+            x="year",
+            y="Annual_Max_Hazard",
+        )
+        fig_rank.update_layout(height=480, xaxis_title="Year", yaxis_title="Annual maximum hazard")
+        st.plotly_chart(fig_rank, use_container_width=True)
+
+# =================================================
+# TAB 8 - NODE FAILURE & CURTAILMENT
+# =================================================
+
+with tab8:
+    st.subheader("Power Grid Node Failure Simulation and Energy Curtailment Risk")
+
+    current_parent = df_selected_year.copy()
+
+    left, right = st.columns(2)
+
+    with left:
+        st.markdown("#### Node failure simulation")
+
+        fig_node = px.choropleth(
+            current_parent,
+            geojson=geojson,
+            locations="region",
+            featureidkey="properties.NUTS_NAME",
+            color="Node_Failure_Pressure",
+            color_continuous_scale="Reds",
+            range_color=[0, 1],
+            hover_data={
+                "region": True,
+                "Node_Failure_Pressure": ":.2f",
+                "P_fail": ":.2f",
+                "MHI": ":.2f",
+            },
+        )
+
+        fig_node.update_geos(fitbounds="locations", visible=False)
+        fig_node.update_traces(marker_line_width=0.9, marker_line_color="black")
+        fig_node.update_layout(height=560, margin=dict(l=0, r=0, t=10, b=0))
+        st.plotly_chart(fig_node, use_container_width=True)
+
+    with right:
+        st.markdown("#### Energy curtailment risk")
+
+        fig_curt = px.bar(
+            current_parent.sort_values("Curtailment_Risk", ascending=False),
+            x="Curtailment_Risk",
+            y="region",
+            orientation="h",
+            color="Curtailment_Risk",
+            color_continuous_scale="OrRd",
+            range_color=[0, 1],
+        )
+
+        fig_curt.update_layout(height=560, xaxis_title="Curtailment risk", yaxis_title="Subregion", coloraxis_showscale=False)
+        st.plotly_chart(fig_curt, use_container_width=True)
+
+    summary = current_parent[["region", "Node_Failure_Pressure", "Curtailment_Risk", "P_fail", "MHI"]].sort_values(
+        "Curtailment_Risk", ascending=False
+    )
+    st.markdown("#### Subregional summary")
+    st.dataframe(summary, use_container_width=True)
+

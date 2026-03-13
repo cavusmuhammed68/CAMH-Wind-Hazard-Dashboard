@@ -11,8 +11,9 @@ import plotly.graph_objects as go
 # =================================================
 
 st.set_page_config(layout="wide", page_title="Climate Digital Twin Dashboard")
+
 st.title("Climate Digital Twin Dashboard")
-st.markdown("Regional hazard, storm-track, risk, and digital-twin style climate dashboard")
+st.markdown("Regional hazard, storm-track, risk, climate digital twin, and local grid-risk dashboard")
 
 # =================================================
 # PATHS
@@ -29,6 +30,20 @@ TRACK_CANDIDATES = [
     os.path.join(BASE_DIR, "C3S_StormTracks_ERA5_1979_2021_clean.csv"),
 ]
 
+CAPACITY_CANDIDATES = [
+    os.path.join(BASE_DIR, "data_raw", "embedded-capacity-register-part-2.csv"),
+    os.path.join(BASE_DIR, "..", "data_raw", "embedded-capacity-register-part-2.csv"),
+]
+
+CURTAIL_CANDIDATES = [
+    os.path.join(BASE_DIR, "data_raw", "curtailment-events-site-specific.csv"),
+    os.path.join(BASE_DIR, "..", "data_raw", "curtailment-events-site-specific.csv"),
+]
+
+FEEDER_CANDIDATES = [
+    os.path.join(BASE_DIR, "data_raw", "npg-ehv-feeders.csv"),
+    os.path.join(BASE_DIR, "..", "data_raw", "npg-ehv-feeders.csv"),
+]
 
 # =================================================
 # LOADERS
@@ -57,29 +72,16 @@ def load_tracks(paths: list[str]) -> pd.DataFrame:
         st.warning("ERA5 storm-track file not found.")
         return pd.DataFrame()
 
-    # Robust CSV loading for large files
     try:
-        tracks = pd.read_csv(
-            track_path,
-            low_memory=False,
-            encoding="utf-8"
-        )
-    except:
-        tracks = pd.read_csv(
-            track_path,
-            low_memory=False,
-            encoding="latin1"
-        )
+        tracks = pd.read_csv(track_path, low_memory=False, encoding="utf-8")
+    except Exception:
+        tracks = pd.read_csv(track_path, low_memory=False, encoding="latin1")
 
     tracks = tracks.copy()
 
-    # -----------------------------
-    # Standardise column names
-    # -----------------------------
     rename_map = {}
 
     for c in tracks.columns:
-
         cl = c.lower()
 
         if cl in ["lat", "latitude"]:
@@ -99,9 +101,6 @@ def load_tracks(paths: list[str]) -> pd.DataFrame:
 
     tracks = tracks.rename(columns=rename_map)
 
-    # -----------------------------
-    # Required columns check
-    # -----------------------------
     required = {"latitude", "longitude", "year"}
 
     if not required.issubset(tracks.columns):
@@ -114,22 +113,177 @@ def load_tracks(paths: list[str]) -> pd.DataFrame:
     if "storm_id" not in tracks.columns:
         tracks["storm_id"] = tracks.groupby("year").cumcount().astype(str)
 
-    # -----------------------------
-    # Clean data
-    # -----------------------------
-    tracks = tracks.dropna(subset=["latitude", "longitude", "year"])
+    tracks = tracks.dropna(subset=["latitude", "longitude", "year"]).copy()
 
     tracks["year"] = pd.to_numeric(tracks["year"], errors="coerce")
-    tracks = tracks.dropna(subset=["year"])
-
+    tracks = tracks.dropna(subset=["year"]).copy()
     tracks["year"] = tracks["year"].astype(int)
 
-    # Convert 0–360 longitude to -180–180
     tracks["longitude"] = tracks["longitude"].apply(
         lambda x: x - 360 if x > 180 else x
     )
 
     return tracks
+
+
+@st.cache_data
+def load_capacity(paths: list[str]) -> pd.DataFrame:
+
+    path = None
+    for p in paths:
+        if os.path.exists(p):
+            path = p
+            break
+
+    if path is None:
+        return pd.DataFrame()
+
+    try:
+        df = pd.read_csv(path, low_memory=False, encoding="utf-8")
+    except Exception:
+        df = pd.read_csv(path, low_memory=False, encoding="latin1")
+
+    df = df.copy()
+
+    if "geopoint" in df.columns:
+        lat_list = []
+        lon_list = []
+
+        for g in df["geopoint"]:
+            try:
+                a, b = str(g).split(",")
+                lat_list.append(float(a.strip()))
+                lon_list.append(float(b.strip()))
+            except Exception:
+                lat_list.append(np.nan)
+                lon_list.append(np.nan)
+
+        df["lat"] = lat_list
+        df["lon"] = lon_list
+
+    elif {"Postcode", "Local Authority"}.issubset(df.columns):
+        df["lat"] = np.nan
+        df["lon"] = np.nan
+
+    capacity_col_candidates = [
+        "Energy Source & Energy Conversion Technology 1 - Registered Capacity (MW)",
+        "Already connected Registered Capacity (MW) ",
+        "Maximum Export Capacity (MW)"
+    ]
+
+    for col in capacity_col_candidates:
+        if col in df.columns:
+            df["capacity_mw"] = pd.to_numeric(df[col], errors="coerce")
+            break
+
+    if "capacity_mw" not in df.columns:
+        df["capacity_mw"] = np.nan
+
+    if "Energy Source 1" not in df.columns:
+        df["Energy Source 1"] = "Unknown"
+
+    if "Postcode" not in df.columns:
+        df["Postcode"] = "Unknown"
+
+    if "Local Authority" not in df.columns:
+        df["Local Authority"] = "Unknown"
+
+    return df
+
+
+@st.cache_data
+def load_curtailment(paths: list[str]) -> pd.DataFrame:
+
+    path = None
+    for p in paths:
+        if os.path.exists(p):
+            path = p
+            break
+
+    if path is None:
+        return pd.DataFrame()
+
+    try:
+        df = pd.read_csv(path, low_memory=False, encoding="utf-8")
+    except Exception:
+        df = pd.read_csv(path, low_memory=False, encoding="latin1")
+
+    df = df.copy()
+
+    if "Start time UTC" in df.columns:
+        df["start_ts"] = pd.to_datetime(df["Start time UTC"], errors="coerce")
+        df["year"] = df["start_ts"].dt.year
+    else:
+        df["year"] = np.nan
+
+    energy_col = "Outage related curtailment-Total energy reduction (MWh)"
+    avg_col = "Average access reduction (MW)"
+
+    if energy_col in df.columns:
+        df["curtailment_mwh"] = pd.to_numeric(df[energy_col], errors="coerce")
+    else:
+        df["curtailment_mwh"] = np.nan
+
+    if avg_col in df.columns:
+        df["avg_access_mw"] = pd.to_numeric(df[avg_col], errors="coerce")
+    else:
+        df["avg_access_mw"] = np.nan
+
+    if "Site" not in df.columns:
+        df["Site"] = "Unknown"
+
+    if "Reason For curtailment" not in df.columns:
+        df["Reason For curtailment"] = "Unknown"
+
+    return df
+
+
+@st.cache_data
+def load_feeders(paths: list[str]) -> pd.DataFrame:
+
+    path = None
+    for p in paths:
+        if os.path.exists(p):
+            path = p
+            break
+
+    if path is None:
+        return pd.DataFrame()
+
+    try:
+        df = pd.read_csv(path, low_memory=False, encoding="utf-8")
+    except Exception:
+        df = pd.read_csv(path, low_memory=False, encoding="latin1")
+
+    df = df.copy()
+
+    if "Geo Point" in df.columns:
+        lat_list = []
+        lon_list = []
+
+        for g in df["Geo Point"]:
+            try:
+                a, b = str(g).split(",")
+                lat_list.append(float(a.strip()))
+                lon_list.append(float(b.strip()))
+            except Exception:
+                lat_list.append(np.nan)
+                lon_list.append(np.nan)
+
+        df["lat"] = lat_list
+        df["lon"] = lon_list
+
+    df = df.dropna(subset=["lat", "lon"], how="any")
+
+    if "Line situation" not in df.columns:
+        df["Line situation"] = "Unknown"
+
+    if "voltage" in df.columns:
+        df["voltage_numeric"] = pd.to_numeric(df["voltage"], errors="coerce")
+    else:
+        df["voltage_numeric"] = np.nan
+
+    return df
 
 # =================================================
 # SOURCE DATA
@@ -138,6 +292,13 @@ def load_tracks(paths: list[str]) -> pd.DataFrame:
 df_parent = load_parent_data(DATA_PATH)
 geojson = load_geojson(GEO_PATH)
 tracks = load_tracks(TRACK_CANDIDATES)
+capacity = load_capacity(CAPACITY_CANDIDATES)
+curtail = load_curtailment(CURTAIL_CANDIDATES)
+feeders = load_feeders(FEEDER_CANDIDATES)
+
+st.write("capacity rows:", len(capacity))
+st.write("feeders rows:", len(feeders))
+st.write("curtail rows:", len(curtail))
 
 # =================================================
 # REGION -> NUTS3 MAP
@@ -185,6 +346,7 @@ def expand_to_subregions(df_parent_in: pd.DataFrame) -> pd.DataFrame:
     for _, r in df_parent_in.iterrows():
         parent = r["region"]
         subs = nuts_map.get(parent, [])
+
         if not subs:
             continue
 
@@ -231,21 +393,63 @@ def expand_to_subregions(df_parent_in: pd.DataFrame) -> pd.DataFrame:
         lambda s: (s - s.min()) / (s.max() - s.min()) if s.max() > s.min() else 0.0
     )
 
-    # Proxy variables for digital twin layers
     df["MHI"] = 0.70 * df["W_norm_year"] + 0.30 * df["W_sub_norm"]
+
     alpha = 1.8
     xi = 0.5 * df["W_sub_norm"] + 0.5 * df["W_norm_year"]
     df["P_fail"] = 1.0 - np.exp(-alpha * df["MHI"] * xi)
 
-    # Curtailment risk proxy
     df["Curtailment_Risk"] = np.clip(0.60 * df["MHI"] + 0.40 * df["P_fail"], 0, 1)
-
-    # Simulated node failure pressure
     df["Node_Failure_Pressure"] = np.clip(0.55 * df["P_fail"] + 0.45 * df["W_sub_norm"], 0, 1)
 
     return df
 
 df = expand_to_subregions(df_parent)
+
+# =================================================
+# LOCAL GRID RISK PREP
+# =================================================
+
+@st.cache_data
+def build_local_grid_risk(capacity_df: pd.DataFrame, curtail_df: pd.DataFrame, feeder_df: pd.DataFrame) -> pd.DataFrame:
+
+    frames = []
+
+    if not capacity_df.empty:
+        cap = capacity_df.copy()
+        cap["point_type"] = "Embedded Capacity"
+        cap["label"] = cap["Postcode"].fillna("Unknown")
+        cap["risk_score"] = pd.to_numeric(cap["capacity_mw"], errors="coerce").fillna(0)
+        cap["detail"] = cap["Energy Source 1"].fillna("Unknown")
+        cap = cap.dropna(subset=["lat", "lon"], how="any")
+        frames.append(cap[["lat", "lon", "point_type", "label", "risk_score", "detail"]])
+
+    if not feeder_df.empty:
+        fd = feeder_df.copy()
+        fd["point_type"] = "Feeder"
+        fd["label"] = fd["Line situation"].fillna("Unknown")
+        fd["risk_score"] = pd.to_numeric(fd["voltage_numeric"], errors="coerce").fillna(0)
+        fd["detail"] = fd["Line situation"].fillna("Unknown")
+        fd = fd.dropna(subset=["lat", "lon"], how="any")
+        frames.append(fd[["lat", "lon", "point_type", "label", "risk_score", "detail"]])
+
+    if not frames:
+        return pd.DataFrame()
+
+    local = pd.concat(frames, ignore_index=True)
+
+    if local["risk_score"].max() > local["risk_score"].min():
+        local["risk_norm"] = (
+            local["risk_score"] - local["risk_score"].min()
+        ) / (
+            local["risk_score"].max() - local["risk_score"].min()
+        )
+    else:
+        local["risk_norm"] = 0.0
+
+    return local
+
+local_grid = build_local_grid_risk(capacity, curtail, feeders)
 
 # =================================================
 # SIDEBAR
@@ -311,7 +515,7 @@ df_selected_parent["P_fail_scenario"] = 1.0 - np.exp(
 # TABS
 # =================================================
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
     "Storm Animation Map",
     "ERA5 Storm Tracks",
     "Hazard Timeline",
@@ -320,6 +524,7 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
     "Storm Intensity Surface",
     "Return Period Analysis",
     "Node Failure & Curtailment",
+    "Local Grid Risk",
 ])
 
 # =================================================
@@ -367,7 +572,7 @@ with tab2:
     st.subheader("ERA5 Storm Tracks")
 
     if tracks.empty:
-        st.warning("ERA5 storm-track file could not be found. Place C3S_StormTracks_ERA5_1979_2021_clean.csv in website/data_raw.")
+        st.warning("ERA5 storm-track file could not be found.")
     else:
         subtab1, subtab2, subtab3 = st.tabs([
             "Track Points",
@@ -381,27 +586,20 @@ with tab2:
                 lat="latitude",
                 lon="longitude",
                 animation_frame="year",
-                color="value",
-                size="value",
                 size_max=12,
                 zoom=4.7,
                 center={"lat": 54.5, "lon": -1.8},
                 color_continuous_scale="Turbo",
+                mapbox_style="carto-positron",
                 hover_data={
                     "storm_id": True,
                     "year": True,
                     "latitude": ":.2f",
                     "longitude": ":.2f",
-                    "value": ":.2f",
                 },
             )
 
-            fig_tracks.update_layout(
-                mapbox_style="carto-positron",
-                height=700,
-                margin=dict(l=0, r=0, t=10, b=0),
-            )
-
+            fig_tracks.update_layout(height=700, margin=dict(l=0, r=0, t=10, b=0))
             st.plotly_chart(fig_tracks, use_container_width=True)
 
         with subtab2:
@@ -421,11 +619,6 @@ with tab2:
                 lon="longitude",
                 color="storm_id",
                 line_group="storm_id",
-                hover_data={
-                    "storm_id": True,
-                    "year": True,
-                    "value": ":.2f",
-                },
                 zoom=4.8,
                 center={"lat": 54.5, "lon": -1.8},
             )
@@ -679,7 +872,7 @@ with tab6:
     st.subheader("Storm Intensity Surface Map")
 
     if tracks.empty:
-        st.warning("ERA5 storm-track file could not be found. Place C3S_StormTracks_ERA5_1979_2021_clean.csv in website/data_raw.")
+        st.warning("ERA5 storm-track file could not be found.")
     else:
         surface_year = st.slider(
             "Select year for storm intensity surface",
@@ -695,7 +888,6 @@ with tab6:
             tracks_surface,
             lat="latitude",
             lon="longitude",
-            z="value",
             radius=18,
             center={"lat": 54.5, "lon": -1.8},
             zoom=4.8,
@@ -807,3 +999,156 @@ with tab8:
     st.markdown("#### Subregional summary")
     st.dataframe(summary, use_container_width=True)
 
+# =================================================
+# TAB 9 - LOCAL GRID RISK
+# =================================================
+
+with tab9:
+
+    st.subheader("Local Grid Risk (postcode / feeders / curtailment)")
+
+    st.write("capacity rows:", len(capacity))
+    st.write("feeders rows:", len(feeders))
+    st.write("curtail rows:", len(curtail))
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Embedded generation sites", len(capacity))
+    c2.metric("Curtailment events", len(curtail))
+    c3.metric("Grid feeders", len(feeders))
+
+    subtab1, subtab2, subtab3, subtab4 = st.tabs([
+        "Embedded Capacity",
+        "Feeder Network",
+        "Curtailment Timeline",
+        "Local Risk Overlay",
+    ])
+
+    with subtab1:
+        st.markdown("#### Embedded generation (postcode locations)")
+
+        if capacity.empty or capacity["lat"].dropna().empty:
+            st.info("Embedded capacity dataset found, but no usable geopoint rows were parsed.")
+        else:
+            fig_cap = px.scatter_mapbox(
+                capacity.dropna(subset=["lat", "lon"]),
+                lat="lat",
+                lon="lon",
+                color="Energy Source 1",
+                size="capacity_mw",
+                hover_data={
+                    "Postcode": True,
+                    "Local Authority": True,
+                    "capacity_mw": ":.2f",
+                    "Energy Source 1": True,
+                },
+                zoom=5,
+                center={"lat": 54.5, "lon": -1.8},
+                mapbox_style="carto-positron",
+            )
+            fig_cap.update_layout(height=650, margin=dict(l=0, r=0, t=10, b=0))
+            st.plotly_chart(fig_cap, use_container_width=True)
+
+    with subtab2:
+        st.markdown("#### Grid feeder network")
+
+        if feeders.empty:
+            st.info("Feeder dataset not available.")
+        else:
+            fig_feed = px.scatter_mapbox(
+                feeders,
+                lat="lat",
+                lon="lon",
+                color="Line situation",
+                size="voltage_numeric",
+                hover_data={
+                    "Line situation": True,
+                    "voltage": True,
+                },
+                zoom=5,
+                center={"lat": 54.5, "lon": -1.8},
+                mapbox_style="carto-positron",
+            )
+            fig_feed.update_layout(height=650, margin=dict(l=0, r=0, t=10, b=0))
+            st.plotly_chart(fig_feed, use_container_width=True)
+
+    with subtab3:
+        st.markdown("#### Curtailment timeline and hotspots")
+
+        if curtail.empty:
+            st.info("Curtailment dataset not available.")
+        else:
+            cur_year = (
+                curtail.groupby("year", as_index=False)
+                .agg(
+                    events=("Event ID", "count"),
+                    curtailment_mwh=("curtailment_mwh", "sum"),
+                )
+            )
+
+            col_a, col_b = st.columns(2)
+
+            with col_a:
+                fig_cur_events = px.line(cur_year, x="year", y="events", markers=True)
+                fig_cur_events.update_layout(height=400, xaxis_title="Year", yaxis_title="Curtailment events")
+                st.plotly_chart(fig_cur_events, use_container_width=True)
+
+            with col_b:
+                fig_cur_mwh = px.line(cur_year, x="year", y="curtailment_mwh", markers=True)
+                fig_cur_mwh.update_layout(height=400, xaxis_title="Year", yaxis_title="Curtailment energy (MWh)")
+                st.plotly_chart(fig_cur_mwh, use_container_width=True)
+
+            site_rank = (
+                curtail.groupby("Site", as_index=False)
+                .agg(
+                    events=("Event ID", "count"),
+                    curtailment_mwh=("curtailment_mwh", "sum"),
+                    avg_access_mw=("avg_access_mw", "mean"),
+                )
+                .sort_values("curtailment_mwh", ascending=False)
+                .head(20)
+            )
+
+            fig_site = px.bar(
+                site_rank,
+                x="curtailment_mwh",
+                y="Site",
+                orientation="h",
+                color="events",
+            )
+            fig_site.update_layout(height=600, xaxis_title="Total curtailed energy (MWh)", yaxis_title="Site")
+            st.plotly_chart(fig_site, use_container_width=True)
+
+    with subtab4:
+        st.markdown("#### Future local outage / curtailment risk")
+
+        if local_grid.empty:
+            st.info("Local capacity / feeder points not available.")
+        else:
+            local = local_grid.copy()
+
+            local["future_risk"] = np.clip(
+                0.45 * local["risk_norm"] + 0.35 * scenario_factor / 1.5 + 0.20 * (selected_year - df["year"].min()) / max(1, (df["year"].max() - df["year"].min())),
+                0,
+                1
+            )
+
+            fig_local = px.scatter_mapbox(
+                local,
+                lat="lat",
+                lon="lon",
+                color="future_risk",
+                size="risk_norm",
+                hover_data={
+                    "point_type": True,
+                    "label": True,
+                    "detail": True,
+                    "future_risk": ":.2f",
+                },
+                color_continuous_scale="Turbo",
+                zoom=5,
+                center={"lat": 54.5, "lon": -1.8},
+                mapbox_style="carto-positron",
+            )
+
+            fig_local.update_layout(height=700, margin=dict(l=0, r=0, t=10, b=0))
+            st.plotly_chart(fig_local, use_container_width=True)

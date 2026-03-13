@@ -145,39 +145,51 @@ def load_capacity(paths: list[str]) -> pd.DataFrame:
 
     df = df.copy()
 
+    #  IMPORTANT
+    df.columns = df.columns.str.strip()
+
+    # -------------------------------------------------
+    # COORDINATES
+    # -------------------------------------------------
+
     if "geopoint" in df.columns:
-        lat_list = []
-        lon_list = []
 
-        for g in df["geopoint"]:
-            try:
-                a, b = str(g).split(",")
-                lat_list.append(float(a.strip()))
-                lon_list.append(float(b.strip()))
-            except Exception:
-                lat_list.append(np.nan)
-                lon_list.append(np.nan)
+        coords = df["geopoint"].astype(str).str.split(",", expand=True)
 
-        df["lat"] = lat_list
-        df["lon"] = lon_list
+        if coords.shape[1] == 2:
+            df["lat"] = pd.to_numeric(coords[0].str.strip(), errors="coerce")
+            df["lon"] = pd.to_numeric(coords[1].str.strip(), errors="coerce")
 
-    elif {"Postcode", "Local Authority"}.issubset(df.columns):
-        df["lat"] = np.nan
-        df["lon"] = np.nan
+    # fallback: Easting/Northing varsa
+    if "lat" not in df.columns or df["lat"].isna().all():
 
-    capacity_col_candidates = [
+        if "Location (X-coordinate): Eastings (where data is held)" in df.columns and \
+           "Location (y-coordinate): Northings (where data is held)" in df.columns:
+
+            df["lat"] = np.nan
+            df["lon"] = np.nan
+
+    # -------------------------------------------------
+    # CAPACITY
+    # -------------------------------------------------
+
+    capacity_candidates = [
         "Energy Source & Energy Conversion Technology 1 - Registered Capacity (MW)",
         "Already connected Registered Capacity (MW) ",
-        "Maximum Export Capacity (MW)"
+        "Maximum Export Capacity (MW)",
     ]
 
-    for col in capacity_col_candidates:
+    for col in capacity_candidates:
         if col in df.columns:
             df["capacity_mw"] = pd.to_numeric(df[col], errors="coerce")
             break
 
     if "capacity_mw" not in df.columns:
         df["capacity_mw"] = np.nan
+
+    # -------------------------------------------------
+    # SAFETY COLUMNS
+    # -------------------------------------------------
 
     if "Energy Source 1" not in df.columns:
         df["Energy Source 1"] = "Unknown"
@@ -187,6 +199,9 @@ def load_capacity(paths: list[str]) -> pd.DataFrame:
 
     if "Local Authority" not in df.columns:
         df["Local Authority"] = "Unknown"
+
+    # temizle
+    df = df.dropna(subset=["lat", "lon"], how="any")
 
     return df
 
@@ -301,10 +316,6 @@ capacity = load_capacity(CAPACITY_CANDIDATES)
 curtail = load_curtailment(CURTAIL_CANDIDATES)
 feeders = load_feeders(FEEDER_CANDIDATES)
 
-st.write("capacity rows:", len(capacity))
-st.write("feeders rows:", len(feeders))
-st.write("curtail rows:", len(curtail))
-
 # =================================================
 # REGION -> NUTS3 MAP
 # =================================================
@@ -411,9 +422,112 @@ def expand_to_subregions(df_parent_in: pd.DataFrame) -> pd.DataFrame:
 
 df = expand_to_subregions(df_parent)
 
+LABELS = {
+    "W_norm_year": "Regional Wind Severity Index",
+    "W_sub_norm": "Local Wind Intensity Index",
+    "MHI": "Multi-Hazard Impact Index",
+    "P_fail": "Grid Failure Probability",
+    "Curtailment_Risk": "Energy Curtailment Risk",
+    "Node_Failure_Pressure": "Substation Stress Index",
+}
+
+labels = LABELS
 # =================================================
 # LOCAL GRID RISK PREP
 # =================================================
+
+# =================================================
+# POSTCODE OUTAGE DIGITAL TWIN MODEL
+# =================================================
+
+@st.cache_data
+def build_postcode_outage_model(capacity_df, hazard_df):
+
+    if capacity_df.empty:
+        return pd.DataFrame()
+
+    sites = capacity_df.copy()
+
+    sites = sites.dropna(subset=["lat","lon"], how="any")
+
+    # capacity based stress
+    sites["capacity_norm"] = (
+        sites["capacity_mw"] - sites["capacity_mw"].min()
+    ) / max(
+        1e-6,
+        sites["capacity_mw"].max() - sites["capacity_mw"].min()
+    )
+
+    # average regional hazard
+    hazard_level = hazard_df["MHI"].mean()
+
+    # storm pressure factor
+    storm_pressure = hazard_level
+
+    # grid overload probability
+    sites["grid_stress"] = (
+        0.6 * sites["capacity_norm"] +
+        0.4 * storm_pressure
+    )
+
+    # outage probability model
+    alpha = 1.6
+    sites["outage_probability"] = 1 - np.exp(-alpha * sites["grid_stress"])
+
+    # curtailment expectation
+    sites["expected_curtailment_mw"] = (
+        sites["capacity_mw"] * sites["outage_probability"]
+    )
+
+    return sites
+
+@st.cache_data
+def build_storm_blackout_model(capacity_df, tracks_df, hazard_df):
+
+    if capacity_df.empty:
+        return pd.DataFrame()
+
+    sites = capacity_df.copy()
+    sites = sites.dropna(subset=["lat","lon"])
+
+    # capacity normalization
+    sites["capacity_norm"] = (
+        sites["capacity_mw"] - sites["capacity_mw"].min()
+    ) / max(1e-6, sites["capacity_mw"].max() - sites["capacity_mw"].min())
+
+    # regional storm pressure
+    storm_pressure = hazard_df["MHI"].mean()
+
+    # wind exposure from storm tracks
+    if not tracks_df.empty:
+
+        storm_density = len(tracks_df) / 5000
+        storm_density = min(storm_density,1)
+
+    else:
+        storm_density = 0.2
+
+    # grid stress
+    sites["grid_stress_index"] = (
+        0.5 * sites["capacity_norm"] +
+        0.3 * storm_pressure +
+        0.2 * storm_density
+    )
+
+    # outage probability
+    alpha = 1.8
+
+    sites["blackout_probability"] = 1 - np.exp(
+        -alpha * sites["grid_stress_index"]
+    )
+
+    # expected curtailment
+    sites["expected_curtailment_mw"] = (
+        sites["capacity_mw"] *
+        sites["blackout_probability"]
+    )
+
+    return sites
 
 @st.cache_data
 def build_local_grid_risk(capacity_df: pd.DataFrame, curtail_df: pd.DataFrame, feeder_df: pd.DataFrame) -> pd.DataFrame:
@@ -516,22 +630,32 @@ df_selected_parent["P_fail_scenario"] = 1.0 - np.exp(
     -1.8 * df_selected_parent["MHI_scenario"] * (0.5 + 0.5 * df_selected_parent["W_sub_norm"])
 )
 
+postcode_risk = build_postcode_outage_model(
+    capacity,
+    df_selected_year
+)
+
+postcode_blackout = build_storm_blackout_model(
+    capacity,
+    tracks,
+    df_selected_year
+)
 # =================================================
 # TABS
 # =================================================
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
-    "Storm Animation Map",
-    "ERA5 Storm Tracks",
-    "Hazard Timeline",
-    "Climate Risk Dashboard",
-    "Scenario Simulation",
-    "Storm Intensity Surface",
-    "Return Period Analysis",
-    "Node Failure & Curtailment",
-    "Local Grid Risk",
+tab1,tab2,tab3,tab4,tab5,tab6,tab7,tab8,tab9,tab10 = st.tabs([
+"Storm Animation",
+"ERA5 Storm Tracks",
+"Hazard Timeline",
+"Climate Risk Dashboard",
+"Scenario Simulation",
+"Storm Intensity Surface",
+"Extreme Storm Return Period",
+"Grid Failure & Curtailment",
+"Local Grid Infrastructure",
+"Storm-Driven Postcode Blackout Risk"
 ])
-
 # =================================================
 # TAB 1 - STORM ANIMATION MAP
 # =================================================
@@ -552,6 +676,7 @@ with tab1:
         animation_frame="year",
         color_continuous_scale="Turbo",
         range_color=[0, 1],
+        labels=LABELS,
         hover_data={
             "parent_region": True,
             "region": True,
@@ -746,6 +871,7 @@ with tab4:
             color="P_fail_scenario",
             color_continuous_scale="RdYlBu_r",
             range_color=[0, 1],
+            labels=LABELS,
             hover_data={
                 "parent_region": True,
                 "region": True,
@@ -776,6 +902,7 @@ with tab4:
             y="region",
             orientation="h",
             color="P_fail",
+            labels=LABELS,
             color_continuous_scale="Turbo",
             range_color=[0, 1],
         )
@@ -798,6 +925,7 @@ with tab4:
         color_continuous_scale="YlOrRd",
         zmin=0,
         zmax=1,
+        labels={"color":"Local Wind Intensity Index"},
     )
 
     fig_heat.update_layout(height=500, coloraxis_colorbar_title="Relative severity", xaxis_title="Year", yaxis_title="Subregion")
@@ -1157,3 +1285,81 @@ with tab9:
 
             fig_local.update_layout(height=700, margin=dict(l=0, r=0, t=10, b=0))
             st.plotly_chart(fig_local, use_container_width=True)
+
+# =================================================
+# TAB 10 - POSTCODE OUTAGE SIMULATION
+# =================================================
+
+with tab10:
+
+    st.subheader("Storm-Driven Postcode Blackout Risk Simulation")
+
+    if postcode_blackout.empty:
+        st.info("No postcode generation sites available.")
+    else:
+
+        c1,c2,c3 = st.columns(3)
+
+        c1.metric(
+            "Generation Sites",
+            len(postcode_blackout)
+        )
+
+        c2.metric(
+            "Average Blackout Probability",
+            f"{postcode_blackout['blackout_probability'].mean():.2f}"
+        )
+
+        c3.metric(
+            "Expected Curtailment (MW)",
+            f"{postcode_blackout['expected_curtailment_mw'].sum():.1f}"
+        )
+
+        st.markdown("### Postcode-Level Grid Failure Risk Map")
+
+        fig_blackout = px.scatter_mapbox(
+            postcode_blackout,
+            lat="lat",
+            lon="lon",
+            size="capacity_mw",
+            color="blackout_probability",
+            hover_data={
+                "Postcode":True,
+                "Local Authority":True,
+                "capacity_mw":":.2f",
+                "blackout_probability":":.2f",
+                "expected_curtailment_mw":":.2f"
+            },
+            color_continuous_scale="Turbo",
+            zoom=5,
+            center={"lat":54.5,"lon":-1.8},
+            mapbox_style="carto-positron"
+        )
+
+        fig_blackout.update_layout(
+            height=720,
+            margin=dict(l=0,r=0,t=10,b=0)
+        )
+
+        st.plotly_chart(fig_blackout,use_container_width=True)
+
+        st.markdown("### Highest Blackout Risk Postcodes")
+
+        risk_rank = (
+            postcode_blackout
+            .sort_values("blackout_probability",ascending=False)
+            .head(20)
+        )
+
+        st.dataframe(
+            risk_rank[
+                [
+                "Postcode",
+                "Local Authority",
+                "capacity_mw",
+                "blackout_probability",
+                "expected_curtailment_mw"
+                ]
+            ],
+            use_container_width=True
+        )

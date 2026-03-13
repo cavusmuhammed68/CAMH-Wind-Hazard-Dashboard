@@ -205,14 +205,19 @@ def load_curtailment(paths: list[str]) -> pd.DataFrame:
 
     try:
         df = pd.read_csv(path, low_memory=False, encoding="utf-8")
-    except Exception:
+    except:
         df = pd.read_csv(path, low_memory=False, encoding="latin1")
 
     df = df.copy()
 
     if "Start time UTC" in df.columns:
+
         df["start_ts"] = pd.to_datetime(df["Start time UTC"], errors="coerce")
-        df["year"] = df["start_ts"].dt.year
+
+        df["year"] = df["start_ts"].apply(
+            lambda x: x.year if pd.notnull(x) else np.nan
+        )
+
     else:
         df["year"] = np.nan
 

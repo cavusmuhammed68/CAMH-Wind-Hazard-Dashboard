@@ -45,20 +45,103 @@ FEEDER_CANDIDATES = [
     os.path.join(BASE_DIR, "..", "data_raw", "npg-ehv-feeders.csv"),
 ]
 
+import requests
+from datetime import datetime
 # =================================================
 # LOADERS
 # =================================================
 
-@st.cache_data
+@st.cache_data(ttl=60)
 def load_parent_data(path: str) -> pd.DataFrame:
     return pd.read_parquet(path).copy()
 
-@st.cache_data
+@st.cache_data(ttl=60)
 def load_geojson(path: str) -> dict:
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
-@st.cache_data
+@st.cache_data(ttl=600)
+def load_live_storms_noaa():
+    try:
+        url = "https://www.ncei.noaa.gov/access/services/data/v1"
+        
+        params = {
+            "dataset": "global-hourly",
+            "stations": "01001099999",  # sample station (UK nearby değiştirilebilir)
+            "startDate": "2023-01-01",
+            "endDate": datetime.now().strftime("%Y-%m-%d"),
+            "format": "json"
+        }
+
+        r = requests.get(url, params=params, timeout=10)
+
+        if r.status_code != 200:
+            return pd.DataFrame()
+
+        data = r.json()
+
+        df = pd.DataFrame(data)
+
+        if df.empty:
+            return df
+
+        # approximate storm proxy (wind speed)
+        if "WND" in df.columns:
+            df["value"] = df["WND"].astype(str).str.split(",", expand=True)[3].astype(float)
+        else:
+            df["value"] = 1
+
+        df["latitude"] = 54.5
+        df["longitude"] = -1.8
+
+        df["year"] = pd.to_datetime(df["DATE"]).dt.year
+
+        df["storm_id"] = df.index.astype(str)
+
+        return df[["latitude","longitude","year","storm_id","value"]]
+
+    except Exception:
+        return pd.DataFrame()
+    
+
+@st.cache_data(ttl=600)
+def load_live_grid_eso():
+    try:
+        url = "https://api.nationalgrideso.com/api/3/action/datastore_search"
+        
+        params = {
+            "resource_id": "d6a4bf54-c63f-4014-a716-49fd3878ca52",  # generation dataset
+            "limit": 1000
+        }
+
+        r = requests.get(url, params=params, timeout=10)
+
+        if r.status_code != 200:
+            return pd.DataFrame()
+
+        data = r.json()["result"]["records"]
+
+        df = pd.DataFrame(data)
+
+        if df.empty:
+            return df
+
+        # approximate fields
+        df["lat"] = 54.5
+        df["lon"] = -1.8
+
+        df["capacity_mw"] = pd.to_numeric(df.get("quantity", 0), errors="coerce")
+
+        df["Postcode"] = "LIVE_GRID"
+        df["Local Authority"] = "ESO"
+        df["Energy Source 1"] = df.get("fuelType", "Unknown")
+
+        return df[["lat","lon","capacity_mw","Postcode","Local Authority","Energy Source 1"]]
+
+    except Exception:
+        return pd.DataFrame()
+    
+@st.cache_data(ttl=60)
 def load_tracks(paths: list[str]) -> pd.DataFrame:
 
     track_path = None
@@ -126,7 +209,7 @@ def load_tracks(paths: list[str]) -> pd.DataFrame:
     return tracks
 
 
-@st.cache_data
+@st.cache_data(ttl=60)
 def load_capacity(paths: list[str]) -> pd.DataFrame:
 
     path = None
@@ -206,7 +289,7 @@ def load_capacity(paths: list[str]) -> pd.DataFrame:
     return df
 
 
-@st.cache_data
+@st.cache_data(ttl=60)
 def load_curtailment(paths: list[str]) -> pd.DataFrame:
 
     path = None
@@ -258,7 +341,7 @@ def load_curtailment(paths: list[str]) -> pd.DataFrame:
     return df
 
 
-@st.cache_data
+@st.cache_data(ttl=60)
 def load_feeders(paths: list[str]) -> pd.DataFrame:
 
     path = None
@@ -311,11 +394,38 @@ def load_feeders(paths: list[str]) -> pd.DataFrame:
 
 df_parent = load_parent_data(DATA_PATH)
 geojson = load_geojson(GEO_PATH)
-tracks = load_tracks(TRACK_CANDIDATES)
-capacity = load_capacity(CAPACITY_CANDIDATES)
+
+use_live = st.sidebar.toggle("Live Digital Twin Mode", value=True)
+
+if use_live:
+
+    tracks_live = load_live_storms_noaa()
+    capacity_live = load_live_grid_eso()
+
+    if not tracks_live.empty:
+        st.success("Using LIVE NOAA storm data")
+        tracks = tracks_live
+    else:
+        tracks = load_tracks(TRACK_CANDIDATES)
+
+    if not capacity_live.empty:
+        st.success("Using LIVE National Grid ESO data")
+        capacity = capacity_live
+    else:
+        capacity = load_capacity(CAPACITY_CANDIDATES)
+
+else:
+    tracks = load_tracks(TRACK_CANDIDATES)
+    capacity = load_capacity(CAPACITY_CANDIDATES)
+
+# diğerleri
 curtail = load_curtailment(CURTAIL_CANDIDATES)
 feeders = load_feeders(FEEDER_CANDIDATES)
 
+# DEBUG
+st.write("LIVE MODE:", use_live)
+st.write("Tracks rows:", len(tracks))
+st.write("Capacity rows:", len(capacity))
 # =================================================
 # REGION -> NUTS3 MAP
 # =================================================
@@ -355,7 +465,7 @@ sub_to_parent = {
 # EXPAND TO SUBREGIONS
 # =================================================
 
-@st.cache_data
+@st.cache_data(ttl=60)
 def expand_to_subregions(df_parent_in: pd.DataFrame) -> pd.DataFrame:
     rows = []
 
@@ -440,7 +550,7 @@ labels = LABELS
 # POSTCODE OUTAGE DIGITAL TWIN MODEL
 # =================================================
 
-@st.cache_data
+@st.cache_data(ttl=60)
 def build_postcode_outage_model(capacity_df, hazard_df):
 
     if capacity_df.empty:
@@ -481,7 +591,7 @@ def build_postcode_outage_model(capacity_df, hazard_df):
 
     return sites
 
-@st.cache_data
+@st.cache_data(ttl=60)
 def build_storm_blackout_model(capacity_df, tracks_df, hazard_df):
 
     if capacity_df.empty:
@@ -529,7 +639,7 @@ def build_storm_blackout_model(capacity_df, tracks_df, hazard_df):
 
     return sites
 
-@st.cache_data
+@st.cache_data(ttl=60)
 def build_local_grid_risk(capacity_df: pd.DataFrame, curtail_df: pd.DataFrame, feeder_df: pd.DataFrame) -> pd.DataFrame:
 
     frames = []
@@ -575,6 +685,8 @@ local_grid = build_local_grid_risk(capacity, curtail, feeders)
 # =================================================
 
 st.sidebar.header("Controls")
+
+#use_live = st.sidebar.toggle("Live Digital Twin Mode", value=True)
 
 selected_parent = st.sidebar.selectbox(
     "Select Main Region",
@@ -1363,3 +1475,8 @@ with tab10:
             ],
             use_container_width=True
         )
+
+# AUTO REFRESH (every 60 sec)
+import time
+time.sleep(60)
+st.rerun()

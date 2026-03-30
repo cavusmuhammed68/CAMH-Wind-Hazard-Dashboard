@@ -5,3 +5,4 @@ plotly
 pyarrow
 fastparquet
 geopandas
+requests
